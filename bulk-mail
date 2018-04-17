@@ -1,0 +1,564 @@
+#!/usr/bin/perl -w
+
+# A bulk-emailer script for one-time mass mailouts.
+#
+# ASSUMPTION: you know what you're doing and won't feed it
+#             something like /etc/passwd
+#
+# NOTE: the "datafile" is now a xSV file with a user-defined
+#       delimiter and a header row. 
+#       It *must* have at least one header field labeled EMAIL.
+#
+# Created: Nov. 16, 2004
+# Updated: Dec. 17, 2004
+# Updated: March 16, 2006 to include MIME template info.
+# Updated: April 4, 2007 to include message counting in SMTP sessions.
+# Updated: June  5, 2008 to improve documentation a bit.
+# Updated: Nov. 29, 2011 to add flag for setting time between SMTP sessions.
+# Updated: Dec. 1, 2011 to add flag to pause between individual outgoing emails.
+# Updated: Oct 24, 2012 to adjust away from using the HOSTNAME env variable.
+#
+#    Copyright 2004 Geof Gowan, geof@jgbg.org
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details: 
+#    http://www.gnu.org/licenses/
+
+use strict;
+use Fcntl;
+use File::Basename;
+use Getopt::Long;
+use Net::SMTP;
+use Net::Domain qw(hostfqdn);
+use Digest::MD5 qw(md5_hex);
+use Date::Format;
+
+my($USAGE,$TEMPLATE,$BODY,$DATA_FILE,$TEMPLATE_FILE,$FROM,$LOCAL,$QUIET,$VERBOSE,$SMTP,$SMTP_MAX,$SMTP_WAIT_TIME,$STEALTH);
+
+# a good default SMTP server for mailing off-campus addresses
+$SMTP = 'smtp.ufl.edu';
+# set maximum number of messages per SMTP session
+$SMTP_MAX = '30';
+# set the default wait time between SMTP sessions
+$SMTP_WAIT_TIME = '1';
+
+&Usage_statement;
+
+&get_and_set_variables;
+
+# Send out the info
+&parse_and_send_it;
+
+#########################
+sub get_and_set_variables {
+#########################
+
+# The "=>" is just a shortcut for assigning an element of a hash
+# inside a Object Oriented subroutine or, in this case, the element 
+# of the subroutine's hash to a variable.
+
+    &GetOptions("data:s" => \$DATA_FILE,
+		"from:s" => \$FROM,
+		"template:s" => \$TEMPLATE_FILE,
+		"smtp:s" => \$SMTP,
+		"max:n" => \$SMTP_MAX,
+		"local" => \$LOCAL,
+		"quiet" => \$QUIET,
+		"verbose" => \$VERBOSE,
+		"wait:n" => \$SMTP_WAIT_TIME,
+		"stealth" => \$STEALTH
+		);
+
+    # Check for all needed flags and files and if they're readable.
+    unless ( $DATA_FILE && $FROM && $TEMPLATE_FILE) {
+	print "ERROR: Need all required arguments.\n";
+	die "\n$USAGE\n";
+    }
+    else {
+    unless  (-r "$DATA_FILE") {
+	print "ERROR: \"".$DATA_FILE."\" can not be read.\n";
+	die "\n$USAGE\n";
+    }
+    unless ($FROM =~  m/\@/){
+	print "ERROR: From address needs to be of the form user\@domain.\n";
+	die "\n$USAGE\n";
+    }
+    unless  (-r "$TEMPLATE_FILE") {
+	print "ERROR: \"".$TEMPLATE_FILE."\" can not be read.\n";
+	die "\n$USAGE\n";
+    }else {
+
+	my($file_size) = -s $TEMPLATE_FILE;
+
+	# Slurp in the template, and see if we got it all.
+	sysopen(MESSAGE, $TEMPLATE_FILE, O_RDONLY);
+	    my($read_size) = read MESSAGE,$TEMPLATE,$file_size;
+        close (MESSAGE);
+	    if ($read_size != $file_size) {
+              print "READ ERROR: FILE: $file_size READ: $read_size\n";
+	      die "\n$USAGE\n";
+	    }
+    }
+    }
+    # If -max set to a non-numeric, set it back to the default.
+    if ($SMTP_MAX eq "0") {$SMTP_MAX = 30};
+
+    # If -wait set to a non-numeric, set it back to the default.
+    if ($SMTP_WAIT_TIME eq "0") {$SMTP_WAIT_TIME = 1};
+}
+
+##########
+sub parse_and_send_it {
+##########
+    my ($delimiter,$headerrow,$email_field,@header,@keys,@params,%PARAMS,$key,$value,$recipient,$smtp_session);
+    my $HOSTNAME = hostfqdn();
+
+sysopen(DATA, $DATA_FILE, O_RDONLY);
+
+# Get and validate the first two special rows of the data file. DIE if bad.
+
+    # Get the delimiter. Die if it isn't exactly one character.
+
+    $delimiter = <DATA>;
+    $delimiter =~ chomp($delimiter);
+    $delimiter = join('',"\\",${delimiter});
+    if (length($delimiter) != 2) {
+	print "ERROR: Delimiter *must* be one character.\n";
+	die "\n$USAGE\n";
+   }
+
+    # Get the header fields. Die if one isn't some form of "email".
+
+    $headerrow = <DATA>;
+    chomp $headerrow;
+    @header = split(/$delimiter/,$headerrow);
+
+    @keys = @header;
+    my $headercheck = '0';
+    my $headerfield;
+
+    while (@keys) {
+	my $headerfield = shift(@keys);
+        if ($headerfield =~ m/^email$/i ) {
+	    $email_field = $headerfield;
+	    $headercheck++;
+	}
+    }
+    unless ($headercheck) {
+	print "ERROR: One field must be labeled EMAIL.\n";
+	die "\n$USAGE\n";
+    }
+
+# Here's where the work starts. It also validates data and will
+# error to STDERR rather than kill the whole run.
+
+# initialize message counter
+my $messages = '0';
+
+while (<DATA>) {
+    chomp;
+
+    %PARAMS = (); # Zeros out the hash from previous iteration.
+    $BODY = $TEMPLATE; # Resets the template for new substitutions.
+    @keys = @header; # Refills the shifted temp array @keys.
+
+    # Fill an array with the fields from the current data row.
+    @params = split(/$delimiter/);
+
+    # Check for appropriate number of entries in the row. 
+    # If they're all there, assign them to a hash. If not, 
+    # error and go to next row.
+
+    if (scalar(@header) != scalar(@params)) {
+	unless ($QUIET) {
+	    print STDERR
+	    "\nERROR: Number of parameters not equal to number of fields\n",
+	    "for row containing values:\n";
+	    print STDERR join(" :: ",@params),
+	    "\nContinuing...\n";
+	}
+	next;
+    }
+    else {    
+	while (@params){
+	    $PARAMS{shift(@keys)} = shift(@params);
+    }
+
+    # Check to see if the EMAIL field has a valid entry.
+    # If not, error and go to the next row.
+    # If it does, send out the email.
+
+    if ($PARAMS{$email_field}){
+       $recipient = $PARAMS{$email_field};
+
+       # Simple check for valid email address before sending.
+       if  ($LOCAL || ($recipient =~  m/\@/)) {
+
+	   # Mail merge the template. This will account
+	   # for merge field formatting errors.
+	   # The field name still need to be
+	   # spelled correctly, though.
+
+	   while (($key,$value) = each %PARAMS){
+	       $BODY =~ s/\{\=\s*?$key\s*?=\}/$value/gi;
+	   }
+
+	   # These next bits puts in valid headers like
+	   # Message-id:, Msg-id:, Date:, From: and 
+	   # To:, which is good for making the note
+	   # less SPAMlike.
+
+	   # Create an acceptable date format.
+	   my $DATE = time2str("%a, %d %b %Y %T %z (%Z)", time);
+
+	   # Create a unique Message ID.
+           # If the connection to the SMTP server is very fast, a hash
+	   # of the date itself will not create a unique message id. 
+	   # Adding in the message number fot this smtp_session should
+	   # be enough.
+	   my $MSID = md5_hex($DATE.$messages);
+
+	   # Tack it all onto the beginning of the message.
+	   $BODY = join "\n","From: $FROM",
+	                     "To: $recipient",
+	                     "Date: $DATE",
+	                     "Message-id: <${MSID}\@${HOSTNAME}>",
+                             $BODY;
+
+	   # If necessary, initiate a connection to the smtp server.
+	   if ($messages eq '0') {
+	       unless ($QUIET) {
+ 	         print "Initiating connection to smpt server: $SMTP\n";
+	       }
+ 	       $smtp_session = Net::SMTP->new(
+				  Host => $SMTP,
+				  Hello => $ENV{HOST},
+				  Timeout => 60,
+				  );
+	   }
+
+	   # This actually sends out the email. 
+
+	   $smtp_session->mail($FROM);
+	   $smtp_session->to($recipient);
+	   $smtp_session->data();
+	   $smtp_session->datasend($BODY);
+	   $smtp_session->dataend();
+#	   $smtp_session->data($BODY);
+#	   $smtp_session->reset;
+	   $messages ++;
+	   
+	   # This goes to STDERR so the user gets some feedback.
+	   # Otherwise, with STDOUT, the #s don't get printed
+	   # until the end.
+	   if ($VERBOSE) { print STDERR '#';}
+
+           } 
+            else {
+		unless ($QUIET){
+		    print STDERR 
+			"\nERROR: Address \"".$recipient.
+			"\" not in \"user\@domain\" format.\n".
+			" Continuing...\n";
+		}
+		next;
+	    }
+
+	   # If the -stealth flag is set, pause for a second 
+	   # to be polite to the smtp server.
+	   if ($STEALTH) {sleep 1;}
+           if ($STEALTH && $VERBOSE) {print STDERR '.';}
+
+    }
+    else {
+	unless ($QUIET){
+	    print STDERR 
+	    "\nERROR: every row of data file must have an \"EMAIL\" entry.\n";
+	    while (($key,$value) = each %PARAMS) {
+		print STDERR $key."= ".$value.", ";
+	    }
+	    print STDERR "\nContinuing...\n";
+	}
+	next;
+    }
+    }
+    if ($messages eq $SMTP_MAX) {
+       # Max messages per session reached, close out session with SMTP server.
+       unless ($QUIET) {
+	   print "\nMaximum messages reached for this session. ".
+	         "Disconnecting from: $SMTP\n";
+       }
+       $smtp_session->quit;
+       sleep $SMTP_WAIT_TIME;
+       $messages = 0;
+    }
+}
+    # End of data, so close out smtp session if necessary.
+    if ($messages != 0) {
+	$smtp_session->quit;
+       }
+
+    print "\nAll done. Have a nice day.\n";
+
+# And close the filehandle.
+close (DATA);
+
+# Have a nice day. It's done.
+
+}
+
+###################
+sub Usage_statement {
+###################
+
+my ($progname) = basename($0); # This gets the command as called by user, 
+                               # lops off the path info so it's easier to 
+                               # understand the usage statement.
+
+# Actual usage statement as printed on the screen
+
+$USAGE = "SEE \"perldoc ".$progname."\" for specifics.\n\n".
+    "USAGE: $progname -data ... -from ... -template ... <optional flags>\n\n".
+    "REQUIRED:\n".
+    "\t-data     The text file with email addresses and other variables\n".
+    "\t          to be merged with the email template.\n".
+    "\t-from     The email address to put in the From: line\n".
+    "\t-template The email template file.\n\n".
+    "OPTIONAL:\n".
+    "\t-smtp     Alternate smtp server. Defaults to ".$SMTP."\n".
+    "\t-max      Maximum messages per SMTP session. Default is ".$SMTP_MAX."\n".
+    "\t-wait     Set pause in seconds between SMTP sessions. Default is ".$SMTP_WAIT_TIME."\n".
+    "\t-local    If delivering to local users, this will disable the\n".
+    "\t          check for \@ in recipient addresses.\n".
+    "\t-quiet    Suppress errors.\n".
+    "\t-stealth  If set, will pause 1 second between each sent email.\n".
+    "\t-verbose  Provide feedback for successfully sent email.\n";
+}
+
+=pod
+
+=head1 JGBG Bulk Mailer v. 0.9.h
+
+Geof Gowan, geof@jgbg.org, April 4, 2007
+
+This is intended to be a functional "mailout" script that allows 
+for a fair amount of personalizing. It's email-merge for admins.
+
+=head2 USAGE: bulk-mail -data ... -from ... -template ... <optional flags>
+
+    REQUIRED:
+
+    -data     The text file with email addresses and other variables
+              to be merged with the email template.
+    -from     The email address to put in the From: line
+    -template The email template file.
+
+    OPTIONAL:
+
+    -smtp     Alternate smtp server. The default is smtp.ufl.edu
+    -max      Maximum messages per SMTP session. Default is 30.
+    -wait     Set pause in seconds between SMTP sessions. Default is 1.
+    -local    If delivering to local users, this will disable the
+              check for \@ in recipient addresses.
+    -quiet    Suppress progress feedback and errors.
+    -stealth  If set, will pause 1 second between each sent email.
+    -verbose  Provide feedback for successfully sent email.
+
+NOTE: You will improve the hamness of your email by putting
+      your From: address in "Real Name <foo@bar.com>"
+      format rather than just a raw email address.
+
+NOTE: If you want to log the output to a file, redirect STDERR
+      by using "2>log.file" at the command line. If you want 
+      all the output to go to the logfile, you will need to 
+      redirect both STDERR *and* STDIN via "2>log.file 1>&2".
+
+=head2 The data file:
+
+This is an xSV file where the first two rows are special. The
+first tells us what to use as a field delimiter and the second
+defines the various field names.
+
+=over
+
+=item The First row.
+
+The First row is a SINGLE CHARACTER. It defines what will be
+used as the field delimiter in the rest of the data file.
+
+Ex:
+    If your delimiter is "*" then the first row of
+    the datafile should be "*".
+    If your delimiter is "|", or "," or "Q", then the
+    first row should *only* contain | or , or Q 
+    respectively.
+
+=item The Second row.
+
+The second row is a list of field names that will be used for
+the merge fields in the email template. They must be separated 
+by your defined field delimiter.
+
+NOTE: One field MUST be called "EMAIL". The rest can be 
+      named anything you want, but one must be EMAIL.
+
+=item The Rest (of the data file).
+
+The third and subsequent rows are values for the fields named
+in the second row. The "EMAIL" field must have a validly formatted
+recipient address (either 'user@domain' or, if -local is used, 
+just 'user').
+
+=back
+
+=head2 The email template file:
+
+This can include headers and should at least have a Subject: 
+line. 
+
+NOTE: You are building an email from scratch. Make sure the 
+      template file is formatted properly. 
+
+The script does add these headers automatically:
+    From:       <from the -from switch>
+    To:         <the EMAIL field from the active row>
+    Date:       <the date and time at message creation>
+    Message-id: <a unique id string for the message>
+
+Merge fields in the template file are formatted like so:
+        {= field name =}
+
+Any time the program finds a merge field in the template, 
+it will be replaced by its value from the current row in
+the data file.
+
+NOTE: The merge field should be formatted properly with a 
+      single space separating the "{=" and "=}" from the 
+      field name. However, any amount of white space (from 
+      none to lots) can separate the field name from the 
+      {= =} brackets. 
+      The field name in the template should also match the 
+      field name from the second row of the data file, but 
+      the match is case-insensitive if you insist on playing
+      with StudlYCaPs. 
+
+=head2 Format:
+
+    X-tra-headers: <blah>
+    Subject: <blah>
+
+    <Body of email>
+
+=head2 Example template:
+
+    X-comments: Merged with your best interest in mind
+    X-comments: No, really.
+    X-whatever: -----------------
+
+    Subject: Quota exceeded for {= Fullname =}
+
+    Dear {= Fullname =},
+
+    You have exceeded your quota on {= server =}. Please 
+    speak with your Departmental Contact to resolve the 
+    issue.
+
+    Take Care,
+
+    {= Computing Group =}
+
+=head2 Adding MIME elements:
+
+    MIME elements require a few extra bits in your email 
+    template file. 
+
+    NOTE: Use "file -i" to determine the file mime type.
+          Use "mimencode" to convert the file to a base64
+          (for binary files) or Quoted-printable (for plain-
+          test files) MIME encoding.
+
+    In the headers, you MUST add:
+
+    Mime-Version:1.0
+    Content-Type: multipart/alternative; boundary="SOMETHING"
+
+    Where the SOMETHING is whatever you'd like to bound
+    your MIME elements. It can be whatever you'd like.
+
+    In the body, each section is wrapped (bounded, if you
+    must) by the boundary string AND a Content-Type declaration.
+    Like so:
+   
+    --SOMETHING
+    Content-Type: text/plain;
+
+    or
+
+    --SOMETHING
+    Content-Type: text/html;
+
+    NOTE: The boundary is PREpended with "--" and the final 
+          boundary declaration has a trailing "--". This should 
+          be the last thing in your template:
+
+    --SOMETHING--
+
+    You may add additional information to the MIME declarations,
+    but the boundary and Content-Type are the minimum necessary.
+
+=head2 Example for adding MIME attachments:
+
+    X-comments: Merged with your best interest in mind
+    X-comments: No, really.
+    X-whatever: --------------------------------------
+    Mime-Version: 1.0
+    Content-Type: multipart/alternative; boundary="_murder_of_crows_"
+    Subject: Test email to {= Fname =} {= Lname =}
+
+    --_murder_of_crows_
+    Content-Type: text/plain;
+    Dear {= Fullname =},
+
+    You have exceeded your quota on {= server =}. Please 
+    speak with your Departmental Contact to resolve the 
+    issue.
+
+    Take Care,
+
+    {= Computing Group =}
+
+    --_murder_of_crows_
+    Content-Type: text/html;
+    <html><body>
+    <P>Dear {= Fullname =},</P>
+
+    <P>You have exceeded your quota on {= server =}. Please 
+    speak with your Departmental Contact to resolve the 
+    issue.</P>
+
+    <P>Take Care,</P>
+
+    <P>{= Computing Group =}</P>
+
+    </body></html>
+    --_murder_of_crows_--
+
+=head2 Required Perl Tools:
+
+CPAN is your friend. You'll need these modules, which
+may or may not be in your Perl install:
+
+    File::Basename
+    Getopt::Long
+    Net::SMTP
+    Digest::MD5
+    Date::Format
+
+=cut
